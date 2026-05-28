@@ -14,7 +14,7 @@ let isShuttingDown = false;
 
 /**
  * @typedef {{ activeContest?: { value: Record<string, unknown> | null, expiresAt: number } }} SessionData
- * @typedef {import("grammy").Context & { session: SessionData, isAdmin?: boolean, requireAdmin?: () => Promise<boolean> }} BotContext
+ * @typedef {import("grammy").Context & { session: SessionData, isAdmin?: boolean, isPrivateChat?: boolean, requireAdmin?: () => Promise<boolean> }} BotContext
  */
 
 /**
@@ -224,6 +224,14 @@ bot.use(session({ initial: initialSession }));
 bot.use(async (ctx, next) => {
   /** @type {BotContext} */
   const typedCtx = ctx;
+  typedCtx.isPrivateChat = ctx.chat?.type === "private";
+
+  await next();
+});
+
+bot.use(async (ctx, next) => {
+  /** @type {BotContext} */
+  const typedCtx = ctx;
   typedCtx.isAdmin = Boolean(ctx.from && config.adminIds.includes(ctx.from.id));
   typedCtx.requireAdmin = async () => {
     if (typedCtx.isAdmin) return true;
@@ -241,6 +249,11 @@ bot.use(async (ctx, next) => {
 
 bot.command("start", async (ctx) => {
   await runCommand(ctx, "start", async (typedCtx) => {
+    if (!typedCtx.isPrivateChat) {
+      await typedCtx.reply("Hi! Send /join in DM with me to join the contest.");
+      return;
+    }
+
     await typedCtx.reply("Welcome to the invite contest bot.");
     await replyWithActiveContest(typedCtx);
   });
@@ -329,6 +342,11 @@ bot.command("contestinfo", async (ctx) => {
 
 bot.command("join", async (ctx) => {
   await runCommand(ctx, "join", async (typedCtx) => {
+    if (!typedCtx.isPrivateChat) {
+      await typedCtx.reply("Please send this command in DM with the bot.");
+      return;
+    }
+
     if (!typedCtx.from) {
       await typedCtx.reply("Could not identify your Telegram account.");
       return;
@@ -365,6 +383,11 @@ bot.command("join", async (ctx) => {
 
 bot.command("wallet", async (ctx) => {
   await runCommand(ctx, "wallet", async (typedCtx) => {
+    if (!typedCtx.isPrivateChat) {
+      await typedCtx.reply("Please submit your wallet in DM with the bot.");
+      return;
+    }
+
     if (!typedCtx.from) {
       await typedCtx.reply("Could not identify your Telegram account.");
       return;
@@ -406,6 +429,11 @@ bot.command("wallet", async (ctx) => {
 
 bot.command("mystats", async (ctx) => {
   await runCommand(ctx, "mystats", async (typedCtx) => {
+    if (!typedCtx.isPrivateChat) {
+      await typedCtx.reply("Please send this command in DM with the bot.");
+      return;
+    }
+
     if (!typedCtx.from) {
       await typedCtx.reply("Could not identify your Telegram account.");
       return;
