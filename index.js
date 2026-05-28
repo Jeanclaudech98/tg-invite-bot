@@ -1,45 +1,194 @@
-const { Bot } = require("grammy");
+const { Bot, session } = require("grammy");
 const config = require("./config");
 const db = require("./db");
 
+const ACTIVE_CONTEST_TTL_MS = 10_000;
+const RATE_LIMIT_WINDOW_MS = 10_000;
+const RATE_LIMIT_MAX_COMMANDS = 5;
+const SHUTDOWN_TIMEOUT_MS = 10_000;
+
 const bot = new Bot(config.botToken);
+const activeContestCache = { value: null, expiresAt: 0 };
+const rateLimitBuckets = new Map();
+let isShuttingDown = false;
 
-function isAdmin(ctx) {
-  return Boolean(ctx.from && config.adminIds.includes(ctx.from.id));
+/**
+ * @typedef {{ activeContest?: { value: Record<string, unknown> | null, expiresAt: number } }} SessionData
+ * @typedef {import("grammy").Context & { session: SessionData, isAdmin?: boolean, requireAdmin?: () => Promise<boolean> }} BotContext
+ */
+
+/**
+ * @returns {SessionData}
+ */
+function initialSession() {
+  return {};
 }
 
-function requireAdmin(ctx) {
-  if (isAdmin(ctx)) {
-    return true;
+/**
+ * @param {unknown} error
+ * @returns {string}
+ */
+function errorMessage(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * @param {BotContext | null} ctx
+ * @param {unknown} error
+ * @param {string} command
+ * @param {Record<string, unknown>} [extra]
+ */
+function logStructuredError(ctx, error, command, extra = {}) {
+  console.error(JSON.stringify({
+    timestamp: new Date().toISOString(),
+    command,
+    userId: ctx?.from?.id || null,
+    chatId: ctx?.chat?.id || null,
+    error: errorMessage(error),
+    ...extra,
+  }));
+}
+
+/**
+ * @param {string} event
+ * @param {Record<string, unknown>} data
+ */
+function logEvent(event, data) {
+  console.log(JSON.stringify({
+    timestamp: new Date().toISOString(),
+    event,
+    ...data,
+  }));
+}
+
+/**
+ * @param {string} value
+ * @returns {string}
+ */
+function sanitizeInput(value) {
+  return String(value || "").trim().replace(/[\u0000-\u001f\u007f]/g, "");
+}
+
+/**
+ * @param {string} value
+ * @returns {string}
+ */
+function escapeMarkdown(value) {
+  return value.replace(/[_*[\]()~`>#+\-=|{}.!\\]/g, "\\$&");
+}
+
+/**
+ * @param {string} value
+ * @param {number} maxLength
+ * @returns {{ ok: true, value: string } | { ok: false, reason: string }}
+ */
+function validateLength(value, maxLength) {
+  const sanitized = sanitizeInput(value);
+  if (sanitized.length > maxLength) {
+    return { ok: false, reason: `Please keep this under ${maxLength} characters.` };
   }
-
-  ctx.reply("Sorry, this command is only available to admins.");
-  return false;
+  return { ok: true, value: sanitized };
 }
 
+/**
+ * @param {Record<string, unknown>} row
+ * @param {string} [fallback]
+ * @returns {string}
+ */
 function userLabel(row, fallback = "Anonymous") {
-  return row.username ? `@${row.username}` : fallback;
+  return row.username ? `@${escapeMarkdown(String(row.username))}` : escapeMarkdown(fallback);
 }
 
+/**
+ * @param {string | Date} value
+ * @returns {string}
+ */
 function formatDate(value) {
   return new Date(value).toISOString().replace("T", " ").replace(".000Z", " UTC");
 }
 
+/**
+ * @param {string} address
+ * @returns {boolean}
+ */
 function validateWallet(address) {
-  return address.startsWith("0x") || address.length >= 26;
+  return /^(0x[a-fA-F0-9]{20,98}|[A-Za-z0-9:_-]{26,100})$/.test(address);
 }
 
+/**
+ * @param {BotContext} ctx
+ * @returns {string}
+ */
 function getCommandText(ctx) {
-  return ctx.message?.text || "";
+  return sanitizeInput(ctx.message?.text || "");
 }
 
-async function getFreshActiveContest() {
-  await db.completeExpiredContests();
-  return db.getActiveContest();
+/**
+ * @param {BotContext} ctx
+ * @returns {Promise<boolean>}
+ */
+async function enforceRateLimit(ctx) {
+  const text = ctx.message?.text || "";
+  if (!text.startsWith("/")) return true;
+
+  const userId = ctx.from?.id;
+  if (!userId) return true;
+
+  const now = Date.now();
+  const bucket = rateLimitBuckets.get(userId) || [];
+  const recent = bucket.filter((timestamp) => now - timestamp < RATE_LIMIT_WINDOW_MS);
+
+  if (recent.length >= RATE_LIMIT_MAX_COMMANDS) {
+    rateLimitBuckets.set(userId, recent);
+    await ctx.reply("Please slow down.");
+    return false;
+  }
+
+  recent.push(now);
+  rateLimitBuckets.set(userId, recent);
+  return true;
 }
 
+/**
+ * @param {BotContext} ctx
+ * @returns {Promise<Record<string, unknown> | null>}
+ */
+async function getCachedActiveContest(ctx) {
+  const now = Date.now();
+
+  if (ctx.session.activeContest && ctx.session.activeContest.expiresAt > now) {
+    return ctx.session.activeContest.value;
+  }
+
+  if (activeContestCache.expiresAt > now) {
+    ctx.session.activeContest = {
+      value: activeContestCache.value,
+      expiresAt: activeContestCache.expiresAt,
+    };
+    return activeContestCache.value;
+  }
+
+  const contest = await db.getActiveContest();
+  activeContestCache.value = contest;
+  activeContestCache.expiresAt = now + ACTIVE_CONTEST_TTL_MS;
+  ctx.session.activeContest = {
+    value: contest,
+    expiresAt: activeContestCache.expiresAt,
+  };
+
+  return contest;
+}
+
+function clearActiveContestCache() {
+  activeContestCache.value = null;
+  activeContestCache.expiresAt = 0;
+}
+
+/**
+ * @param {BotContext} ctx
+ */
 async function replyWithActiveContest(ctx) {
-  const contest = await getFreshActiveContest();
+  const contest = await getCachedActiveContest(ctx);
 
   if (!contest) {
     await ctx.reply("No active contest is running right now.");
@@ -48,269 +197,373 @@ async function replyWithActiveContest(ctx) {
 
   await ctx.reply(
     [
-      `Active contest: ${contest.title}`,
+      `Active contest: ${escapeMarkdown(String(contest.title))}`,
       `Ends: ${formatDate(contest.ends_at)}`,
       "Use /join to enter and get your invite link.",
     ].join("\n"),
+    { parse_mode: "MarkdownV2" },
   );
 }
 
-bot.command("start", async (ctx) => {
+/**
+ * @param {BotContext} ctx
+ * @param {string} command
+ * @param {(ctx: BotContext) => Promise<void>} handler
+ */
+async function runCommand(ctx, command, handler) {
   try {
-    await ctx.reply("Welcome to the invite contest bot.");
-    await replyWithActiveContest(ctx);
+    await handler(ctx);
   } catch (error) {
-    console.error("Failed to handle /start:", error);
-    await ctx.reply("Something went wrong while loading contest info.");
+    logStructuredError(ctx, error, command);
+    await ctx.reply("Something went wrong. Please try again later.");
   }
+}
+
+bot.use(session({ initial: initialSession }));
+
+bot.use(async (ctx, next) => {
+  /** @type {BotContext} */
+  const typedCtx = ctx;
+  typedCtx.isAdmin = Boolean(ctx.from && config.adminIds.includes(ctx.from.id));
+  typedCtx.requireAdmin = async () => {
+    if (typedCtx.isAdmin) return true;
+    await typedCtx.reply("Sorry, this command is only available to admins.");
+    return false;
+  };
+
+  await next();
+});
+
+bot.use(async (ctx, next) => {
+  if (!(await enforceRateLimit(ctx))) return;
+  await next();
+});
+
+bot.command("start", async (ctx) => {
+  await runCommand(ctx, "start", async (typedCtx) => {
+    await typedCtx.reply("Welcome to the invite contest bot.");
+    await replyWithActiveContest(typedCtx);
+  });
 });
 
 bot.command("newcontest", async (ctx) => {
-  if (!requireAdmin(ctx)) return;
+  await runCommand(ctx, "newcontest", async (typedCtx) => {
+    if (!(await typedCtx.requireAdmin())) return;
 
-  try {
-    const text = getCommandText(ctx).replace(/^\/newcontest(@\w+)?\s*/i, "");
-    const [rawTitle, rawDuration] = text.split("|").map((part) => part && part.trim());
-    const durationHours = Number(rawDuration);
+    const text = getCommandText(typedCtx).replace(/^\/newcontest(@\w+)?\s*/i, "");
+    const [rawTitle = "", rawDuration = ""] = text.split("|");
+    const titleResult = validateLength(rawTitle, 100);
+    const durationHours = Number(sanitizeInput(rawDuration));
 
-    if (!rawTitle || !Number.isFinite(durationHours) || durationHours <= 0) {
-      await ctx.reply("Usage: /newcontest <title> | <duration_hours>");
+    if (!titleResult.ok) {
+      await typedCtx.reply(titleResult.reason);
       return;
     }
 
-    const existingContest = await getFreshActiveContest();
+    if (!titleResult.value || !Number.isFinite(durationHours) || durationHours <= 0 || durationHours > 24 * 365) {
+      await typedCtx.reply("Usage: /newcontest <title> | <duration_hours>");
+      return;
+    }
+
+    const existingContest = await getCachedActiveContest(typedCtx);
     if (existingContest) {
-      await ctx.reply("There is already an active contest. Use /endcontest first.");
+      await typedCtx.reply("There is already an active contest. Use /endcontest first.");
       return;
     }
 
-    const contest = await db.createContest(rawTitle, durationHours);
-    await ctx.reply(
+    const contest = await db.createContest(titleResult.value, durationHours);
+    clearActiveContestCache();
+    typedCtx.session.activeContest = undefined;
+
+    await typedCtx.reply(
       [
-        `Contest created: ${contest.title}`,
+        `Contest created: ${escapeMarkdown(String(contest.title))}`,
         `Ends: ${formatDate(contest.ends_at)}`,
       ].join("\n"),
+      { parse_mode: "MarkdownV2" },
     );
-  } catch (error) {
-    console.error("Failed to handle /newcontest:", error);
-    await ctx.reply("Could not create the contest. Please check the format and try again.");
-  }
+  });
 });
 
 bot.command("endcontest", async (ctx) => {
-  if (!requireAdmin(ctx)) return;
+  await runCommand(ctx, "endcontest", async (typedCtx) => {
+    if (!(await typedCtx.requireAdmin())) return;
 
-  try {
     const contest = await db.endActiveContest();
+    clearActiveContestCache();
+    typedCtx.session.activeContest = undefined;
+
     if (!contest) {
-      await ctx.reply("There is no active contest to end.");
+      await typedCtx.reply("There is no active contest to end.");
       return;
     }
 
-    await ctx.reply(`Contest ended: ${contest.title}`);
-  } catch (error) {
-    console.error("Failed to handle /endcontest:", error);
-    await ctx.reply("Could not end the contest right now.");
-  }
+    await typedCtx.reply(`Contest ended: ${escapeMarkdown(String(contest.title))}`, { parse_mode: "MarkdownV2" });
+  });
 });
 
 bot.command("contestinfo", async (ctx) => {
-  if (!requireAdmin(ctx)) return;
+  await runCommand(ctx, "contestinfo", async (typedCtx) => {
+    if (!(await typedCtx.requireAdmin())) return;
 
-  try {
-    const contest = await getFreshActiveContest();
+    const contest = await getCachedActiveContest(typedCtx);
     if (!contest) {
-      await ctx.reply("No active contest is running right now.");
+      await typedCtx.reply("No active contest is running right now.");
       return;
     }
 
     const stats = await db.getContestStats(contest.id);
-    await ctx.reply(
+    await typedCtx.reply(
       [
-        `Contest: ${stats.title}`,
-        `Status: ${stats.status}`,
+        `Contest: ${escapeMarkdown(String(stats.title))}`,
+        `Status: ${escapeMarkdown(String(stats.status))}`,
         `Started: ${formatDate(stats.starts_at)}`,
         `Ends: ${formatDate(stats.ends_at)}`,
         `Participants: ${stats.participant_count}`,
         `Invites: ${stats.invite_count}`,
       ].join("\n"),
+      { parse_mode: "MarkdownV2" },
     );
-  } catch (error) {
-    console.error("Failed to handle /contestinfo:", error);
-    await ctx.reply("Could not load contest info right now.");
-  }
+  });
 });
 
 bot.command("join", async (ctx) => {
-  try {
-    if (!ctx.from) {
-      await ctx.reply("Could not identify your Telegram account.");
+  await runCommand(ctx, "join", async (typedCtx) => {
+    if (!typedCtx.from) {
+      await typedCtx.reply("Could not identify your Telegram account.");
       return;
     }
 
-    const contest = await getFreshActiveContest();
+    const contest = await getCachedActiveContest(typedCtx);
     if (!contest) {
-      await ctx.reply("No active contest is running right now.");
+      await typedCtx.reply("No active contest is running right now.");
       return;
     }
 
-    const existingParticipant = await db.getParticipant(contest.id, ctx.from.id);
+    const existingParticipant = await db.getParticipant(contest.id, typedCtx.from.id);
     if (existingParticipant?.invite_link) {
-      await ctx.reply(`You are already in the contest.\nYour invite link: ${existingParticipant.invite_link}`);
+      await typedCtx.reply(`You are already in the contest.\nYour invite link: ${existingParticipant.invite_link}`);
       return;
     }
 
     const invite = await bot.api.createChatInviteLink(config.groupChatId, {
       member_limit: 1,
-      name: `contest-${contest.id}-user-${ctx.from.id}`,
+      name: `contest-${contest.id}-user-${typedCtx.from.id}`,
     });
-    const participant = await db.upsertParticipant(contest.id, ctx.from, invite.invite_link);
+    const participant = await db.upsertParticipant(contest.id, typedCtx.from, invite.invite_link);
 
-    await ctx.reply(
+    await typedCtx.reply(
       [
-        `You joined: ${contest.title}`,
+        `You joined: ${escapeMarkdown(String(contest.title))}`,
         `Your invite link: ${participant.invite_link}`,
         "Share it with one person. Each successful join counts as one invite.",
       ].join("\n"),
+      { parse_mode: "MarkdownV2" },
     );
-  } catch (error) {
-    console.error("Failed to handle /join:", error);
-    await ctx.reply("Could not create your invite link right now. Please try again later.");
-  }
+  });
 });
 
 bot.command("wallet", async (ctx) => {
-  try {
-    if (!ctx.from) {
-      await ctx.reply("Could not identify your Telegram account.");
+  await runCommand(ctx, "wallet", async (typedCtx) => {
+    if (!typedCtx.from) {
+      await typedCtx.reply("Could not identify your Telegram account.");
       return;
     }
 
-    const walletAddress = getCommandText(ctx).replace(/^\/wallet(@\w+)?\s*/i, "").trim();
-    if (!walletAddress) {
-      await ctx.reply("Usage: /wallet <address>");
+    const walletAddress = getCommandText(typedCtx).replace(/^\/wallet(@\w+)?\s*/i, "");
+    const walletResult = validateLength(walletAddress, 100);
+
+    if (!walletResult.ok) {
+      await typedCtx.reply(walletResult.reason);
       return;
     }
 
-    if (!validateWallet(walletAddress)) {
-      await ctx.reply("Wallet address must start with 0x or be at least 26 characters long.");
+    if (!walletResult.value) {
+      await typedCtx.reply("Usage: /wallet <address>");
       return;
     }
 
-    const contest = await getFreshActiveContest();
+    if (!validateWallet(walletResult.value)) {
+      await typedCtx.reply("That wallet address does not look valid. Please check it and try again.");
+      return;
+    }
+
+    const contest = await getCachedActiveContest(typedCtx);
     if (!contest) {
-      await ctx.reply("No active contest is running right now.");
+      await typedCtx.reply("No active contest is running right now.");
       return;
     }
 
-    const participant = await db.updateWallet(contest.id, ctx.from.id, walletAddress);
+    const participant = await db.updateWallet(contest.id, typedCtx.from.id, walletResult.value);
     if (!participant) {
-      await ctx.reply("Join the active contest first with /join, then submit your wallet.");
+      await typedCtx.reply("Join the active contest first with /join, then submit your wallet.");
       return;
     }
 
-    await ctx.reply("Wallet saved.");
-  } catch (error) {
-    console.error("Failed to handle /wallet:", error);
-    await ctx.reply("Could not save your wallet right now.");
-  }
+    await typedCtx.reply("Wallet saved.");
+  });
 });
 
 bot.command("mystats", async (ctx) => {
-  try {
-    if (!ctx.from) {
-      await ctx.reply("Could not identify your Telegram account.");
+  await runCommand(ctx, "mystats", async (typedCtx) => {
+    if (!typedCtx.from) {
+      await typedCtx.reply("Could not identify your Telegram account.");
       return;
     }
 
-    const contest = await getFreshActiveContest();
+    const contest = await getCachedActiveContest(typedCtx);
     if (!contest) {
-      await ctx.reply("No active contest is running right now.");
+      await typedCtx.reply("No active contest is running right now.");
       return;
     }
 
-    const participant = await db.getParticipant(contest.id, ctx.from.id);
+    const participant = await db.getParticipantWithInviteCount(contest.id, typedCtx.from.id);
     if (!participant) {
-      await ctx.reply("You have not joined the active contest yet. Use /join first.");
+      await typedCtx.reply("You have not joined the active contest yet. Use /join first.");
       return;
     }
 
-    const inviteCount = await db.getInviteCount(contest.id, ctx.from.id);
-    await ctx.reply(
+    await typedCtx.reply(
       [
-        `Contest: ${contest.title}`,
-        `Your invites: ${inviteCount}`,
-        `Wallet: ${participant.wallet_address || "not submitted"}`,
+        `Contest: ${escapeMarkdown(String(contest.title))}`,
+        `Your invites: ${participant.invite_count}`,
+        `Wallet: ${participant.wallet_address ? escapeMarkdown(String(participant.wallet_address)) : "not submitted"}`,
         `Invite link: ${participant.invite_link}`,
       ].join("\n"),
+      { parse_mode: "MarkdownV2" },
     );
-  } catch (error) {
-    console.error("Failed to handle /mystats:", error);
-    await ctx.reply("Could not load your stats right now.");
-  }
+  });
 });
 
 bot.command("leaderboard", async (ctx) => {
-  try {
-    const contest = await getFreshActiveContest();
+  await runCommand(ctx, "leaderboard", async (typedCtx) => {
+    const contest = await getCachedActiveContest(typedCtx);
     if (!contest) {
-      await ctx.reply("No active contest is running right now.");
+      await typedCtx.reply("No active contest is running right now.");
       return;
     }
 
     const rows = await db.getLeaderboard(contest.id, 10);
     if (rows.length === 0) {
-      await ctx.reply("No one has joined the contest yet.");
+      await typedCtx.reply("No one has joined the contest yet.");
       return;
     }
 
     const lines = rows.map((row, index) => {
-      return `${index + 1}. ${userLabel(row, `User ${row.user_id}`)} - ${row.invite_count} invites`;
+      return `${index + 1}\\. ${userLabel(row, `User ${row.user_id}`)} \\- ${row.invite_count} invites`;
     });
 
-    await ctx.reply([`Leaderboard: ${contest.title}`, ...lines].join("\n"));
-  } catch (error) {
-    console.error("Failed to handle /leaderboard:", error);
-    await ctx.reply("Could not load the leaderboard right now.");
-  }
+    await typedCtx.reply([`Leaderboard: ${escapeMarkdown(String(contest.title))}`, ...lines].join("\n"), {
+      parse_mode: "MarkdownV2",
+    });
+  });
 });
 
 bot.on("message:new_chat_members", async (ctx) => {
-  try {
-    const inviteLink = ctx.message?.invite_link?.invite_link;
+  await runCommand(ctx, "new_chat_members", async (typedCtx) => {
+    const inviteLink = typedCtx.message?.invite_link?.invite_link;
+    const inviteName = typedCtx.message?.invite_link?.name || null;
+
     if (!inviteLink) {
+      logEvent("invite_event_ignored", { reason: "missing_invite_link", chatId: typedCtx.chat?.id || null });
       return;
     }
 
     const inviter = await db.getParticipantByInviteLink(inviteLink);
     if (!inviter || inviter.contest_status !== "active" || new Date(inviter.ends_at) <= new Date()) {
+      logEvent("invite_event_ignored", {
+        reason: "inactive_or_unknown_link",
+        inviteName,
+        chatId: typedCtx.chat?.id || null,
+      });
       return;
     }
 
-    for (const member of ctx.message.new_chat_members) {
+    for (const member of typedCtx.message.new_chat_members) {
       if (member.is_bot || member.id === Number(inviter.user_id)) {
+        logEvent("invite_event_ignored", {
+          reason: member.is_bot ? "bot_member" : "self_invite",
+          contestId: inviter.contest_id,
+          inviterUserId: inviter.user_id,
+          invitedUserId: member.id,
+          inviteName,
+        });
         continue;
       }
 
-      await db.recordInvite(inviter.contest_id, inviter.user_id, member);
+      const recorded = await db.recordInvite(
+        inviter.contest_id,
+        Number(inviter.user_id),
+        inviter.username || null,
+        member,
+      );
+
+      logEvent(recorded ? "invite_recorded" : "invite_duplicate_ignored", {
+        contestId: inviter.contest_id,
+        inviterUserId: inviter.user_id,
+        inviterUsername: inviter.username || null,
+        invitedUserId: member.id,
+        invitedUsername: member.username || null,
+        inviteName,
+      });
     }
-  } catch (error) {
-    console.error("Failed to track invite:", error);
-  }
+  });
 });
 
 bot.catch((error) => {
-  console.error("Bot error:", error);
+  logStructuredError(error.ctx, error.error, "bot");
 });
+
+/**
+ * @param {string} signal
+ */
+async function shutdown(signal) {
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+
+  logEvent("shutdown_started", { signal });
+
+  const timeout = setTimeout(() => {
+    logStructuredError(null, new Error("Graceful shutdown timed out"), "shutdown", { signal });
+    process.exit(1);
+  }, SHUTDOWN_TIMEOUT_MS);
+
+  try {
+    await bot.stop();
+  } catch (error) {
+    logStructuredError(null, error, "shutdown_bot", { signal });
+  }
+
+  try {
+    await db.close();
+  } catch (error) {
+    logStructuredError(null, error, "shutdown_db", { signal });
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  logEvent("shutdown_completed", { signal });
+  process.exit(0);
+}
 
 async function main() {
   try {
+    await db.assertReachable();
     await db.initSchema();
+    await bot.init();
+
+    process.once("SIGTERM", () => {
+      void shutdown("SIGTERM");
+    });
+    process.once("SIGINT", () => {
+      void shutdown("SIGINT");
+    });
+
     await bot.start();
   } catch (error) {
-    console.error("Failed to start bot:", error);
+    logStructuredError(null, error, "startup");
     await db.close().catch((closeError) => {
-      console.error("Failed to close database pool:", closeError);
+      logStructuredError(null, closeError, "startup_db_close");
     });
     process.exitCode = 1;
   }
@@ -322,6 +575,9 @@ if (require.main === module) {
 
 module.exports = {
   bot,
+  escapeMarkdown,
   main,
+  sanitizeInput,
+  shutdown,
   validateWallet,
 };
