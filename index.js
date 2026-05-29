@@ -12,6 +12,18 @@ const activeContestCache = { value: null, expiresAt: 0 };
 const rateLimitBuckets = new Map();
 let isShuttingDown = false;
 
+const BOT_COMMANDS = [
+  { command: "start", description: "Show welcome message and active contest" },
+  { command: "help", description: "Show available commands" },
+  { command: "join", description: "Join the active contest (DM only)" },
+  { command: "wallet", description: "Submit your wallet address (DM only)" },
+  { command: "mystats", description: "View your invite stats (DM only)" },
+  { command: "leaderboard", description: "View the invite leaderboard" },
+  { command: "contestinfo", description: "Admin: view contest details" },
+  { command: "newcontest", description: "Admin: create a new contest" },
+  { command: "endcontest", description: "Admin: end the active contest" },
+];
+
 /**
  * @typedef {{ activeContest?: { value: Record<string, unknown> | null, expiresAt: number } }} SessionData
  * @typedef {import("grammy").Context & { session: SessionData, isAdmin?: boolean, isPrivateChat?: boolean, requireAdmin?: () => Promise<boolean> }} BotContext
@@ -198,7 +210,7 @@ async function replyWithActiveContest(ctx) {
   await ctx.reply(
     [
       `Active contest: ${escapeMarkdown(String(contest.title))}`,
-      `Ends: ${formatDate(contest.ends_at)}`,
+      `Ends: ${escapeMarkdown(formatDate(contest.ends_at))}`,
       "Use /join to enter and get your invite link.",
     ].join("\n"),
     { parse_mode: "MarkdownV2" },
@@ -259,6 +271,13 @@ bot.command("start", async (ctx) => {
   });
 });
 
+bot.command("help", async (ctx) => {
+  await runCommand(ctx, "help", async (typedCtx) => {
+    const lines = BOT_COMMANDS.map(({ command, description }) => `/${command} - ${description}`);
+    await typedCtx.reply(["Available commands:", ...lines].join("\n"));
+  });
+});
+
 bot.command("newcontest", async (ctx) => {
   await runCommand(ctx, "newcontest", async (typedCtx) => {
     if (!(await typedCtx.requireAdmin())) return;
@@ -291,7 +310,7 @@ bot.command("newcontest", async (ctx) => {
     await typedCtx.reply(
       [
         `Contest created: ${escapeMarkdown(String(contest.title))}`,
-        `Ends: ${formatDate(contest.ends_at)}`,
+        `Ends: ${escapeMarkdown(formatDate(contest.ends_at))}`,
       ].join("\n"),
       { parse_mode: "MarkdownV2" },
     );
@@ -330,8 +349,8 @@ bot.command("contestinfo", async (ctx) => {
       [
         `Contest: ${escapeMarkdown(String(stats.title))}`,
         `Status: ${escapeMarkdown(String(stats.status))}`,
-        `Started: ${formatDate(stats.starts_at)}`,
-        `Ends: ${formatDate(stats.ends_at)}`,
+        `Started: ${escapeMarkdown(formatDate(stats.starts_at))}`,
+        `Ends: ${escapeMarkdown(formatDate(stats.ends_at))}`,
         `Participants: ${stats.participant_count}`,
         `Invites: ${stats.invite_count}`,
       ].join("\n"),
@@ -373,7 +392,7 @@ bot.command("join", async (ctx) => {
     await typedCtx.reply(
       [
         `You joined: ${escapeMarkdown(String(contest.title))}`,
-        `Your invite link: ${participant.invite_link}`,
+        `Your invite link: ${escapeMarkdown(String(participant.invite_link))}`,
         "Share it with one person. Each successful join counts as one invite.",
       ].join("\n"),
       { parse_mode: "MarkdownV2" },
@@ -456,7 +475,7 @@ bot.command("mystats", async (ctx) => {
         `Contest: ${escapeMarkdown(String(contest.title))}`,
         `Your invites: ${participant.invite_count}`,
         `Wallet: ${participant.wallet_address ? escapeMarkdown(String(participant.wallet_address)) : "not submitted"}`,
-        `Invite link: ${participant.invite_link}`,
+        `Invite link: ${escapeMarkdown(String(participant.invite_link))}`,
       ].join("\n"),
       { parse_mode: "MarkdownV2" },
     );
@@ -579,6 +598,7 @@ async function main() {
     await db.assertReachable();
     await db.initSchema();
     await bot.init();
+    await bot.api.setMyCommands(BOT_COMMANDS);
 
     process.once("SIGTERM", () => {
       void shutdown("SIGTERM");
